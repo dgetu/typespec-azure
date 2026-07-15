@@ -1792,7 +1792,7 @@ export function dogDeserializer(item: any): Dog {
 
 ```ts operations
 import { TestingContext as Client } from "./index.js";
-import { petUnionDeserializer, PetUnion } from "../models/models.js";
+import { PetUnion, petUnionDeserializer } from "../models/models.js";
 import { ReadOptionalParams } from "./options.js";
 import {
   StreamableMethod,
@@ -1971,7 +1971,7 @@ export function petUnionArrayDeserializer(result: Array<PetUnion>): any[] {
 
 ```ts operations
 import { TestingContext as Client } from "./index.js";
-import { petUnionDeserializer, PetUnion } from "../models/models.js";
+import { PetUnion, petUnionDeserializer } from "../models/models.js";
 import { ReadOptionalParams } from "./options.js";
 import {
   StreamableMethod,

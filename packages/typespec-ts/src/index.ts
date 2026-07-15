@@ -276,7 +276,7 @@ export async function $onEmit(context: EmitContext) {
     await Effect.runPromise(
       generateModularSources(
         { sourceRoot: sourcesRoot, testRoot: dpgContext.generationPathDetail?.rootDir },
-        (_registry) =>
+        (registry) =>
           Effect.gen(function* () {
             emitLoggerFile(modularEmitterOptions, sourcesRoot);
 
@@ -284,7 +284,7 @@ export async function $onEmit(context: EmitContext) {
               overwrite: true,
             });
 
-            emitTypes(dpgContext, { sourceRoot: sourcesRoot });
+            yield* emitTypes(dpgContext, { sourceRoot: sourcesRoot }, registry);
             emitNonModelResponseTypes(dpgContext, { sourceRoot: sourcesRoot });
             buildSubpathIndexFile(modularEmitterOptions, "models", undefined, {
               recursive: true,

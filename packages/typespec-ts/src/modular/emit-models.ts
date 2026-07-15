@@ -18,6 +18,7 @@ import {
   SdkUnionType,
   UsageFlags,
 } from "@azure-tools/typespec-client-generator-core";
+import { Effect, pipe } from "effect";
 import {
   EnumDeclarationStructure,
   EnumMemberStructure,
@@ -47,6 +48,7 @@ import {
 } from "../framework/hooks/sdk-types.js";
 import { refkey } from "../framework/refkey.js";
 import { beginSourceFileBatch, flushSourceFileBatch } from "../framework/source-file-batch.js";
+import type { SourceGenerationRegistry } from "../framework/source-generation.js";
 import { reportDiagnostic } from "../lib.js";
 import { getClientHierarchyMap } from "../utils/client-utils.js";
 import { SdkContext } from "../utils/interfaces.js";
@@ -59,6 +61,7 @@ import {
   checkWrapNonModelReturn,
   getAllAncestors,
   getAllProperties,
+  getPropertySerializedName,
 } from "./helpers/operation-helpers.js";
 import { getDirectSubtypes } from "./helpers/type-helpers.js";
 import {
@@ -76,6 +79,12 @@ import {
   buildXmlObjectModelSerializer,
   hasXmlSerialization,
 } from "./serialization/build-xml-serializer-function.js";
+import type { DiscriminatedUnionInput } from "./serialization/discriminated-union/input.js";
+import { prepareDiscriminatedUnionDeclaration } from "./serialization/discriminated-union/prepare.js";
+import {
+  effectFromEither,
+  refineDiscriminatedUnion,
+} from "./serialization/discriminated-union/refinement.js";
 import {
   getAllDiscriminatedValues,
   getPropertyWithOverrides,
@@ -113,59 +122,82 @@ function isGenerableType(
       !type.isGeneratedName)
   );
 }
-export function emitTypes(context: SdkContext, { sourceRoot }: { sourceRoot: string }) {
+export function emitTypes(
+  context: SdkContext,
+  { sourceRoot }: { sourceRoot: string },
+  registry: SourceGenerationRegistry,
+) {
   const outputProject = useContext("outputProject");
 
-  let sourceFile;
-
-  beginSourceFileBatch();
-  try {
-    for (const type of emitQueue) {
-      if (!isGenerableType(type)) {
-        continue;
+  return Effect.gen(function* () {
+    const discriminatedUnionInputs = new Map<
+      SdkModelType,
+      {
+        readonly serializer: DiscriminatedUnionInput<SdkModelType>;
+        readonly deserializer: DiscriminatedUnionInput<SdkModelType>;
       }
+    >();
+    for (const type of emitQueue) {
+      if (type.kind !== "model" || !isDiscriminatedUnion(type)) continue;
+      const inputs = {
+        serializer: collectDiscriminatedUnionInput(context, type, UsageFlags.Input),
+        deserializer: collectDiscriminatedUnionInput(context, type, UsageFlags.Output),
+      };
+      yield* pipe(inputs.serializer, refineDiscriminatedUnion("serializer"), effectFromEither);
+      yield* pipe(inputs.deserializer, refineDiscriminatedUnion("deserializer"), effectFromEither);
+      discriminatedUnionInputs.set(type, inputs);
+    }
 
-      const namespaces = getModelNamespaces(context, type);
-      const filepath = getModelsPath(sourceRoot, namespaces);
-      sourceFile = outputProject.getSourceFile(filepath);
-      if (!sourceFile) {
-        sourceFile = outputProject.createSourceFile(filepath);
-        sourceFile.addStatements(`/*
+    let sourceFile;
+    beginSourceFileBatch();
+    try {
+      for (const type of emitQueue) {
+        if (!isGenerableType(type)) {
+          continue;
+        }
+
+        const namespaces = getModelNamespaces(context, type);
+        const filepath = getModelsPath(sourceRoot, namespaces);
+        sourceFile = outputProject.getSourceFile(filepath);
+        if (!sourceFile) {
+          sourceFile = outputProject.createSourceFile(filepath);
+          sourceFile.addStatements(`/*
 * This file contains only generated model types and their (de)serializers.
 * Disable the following rules for internal models with '_' prefix and deserializers which require 'any' for raw JSON input.
 */
 /* eslint-disable @typescript-eslint/naming-convention */
 /* eslint-disable @typescript-eslint/explicit-module-boundary-types */`);
+        }
+        yield* emitType(context, type, sourceFile, registry, discriminatedUnionInputs);
       }
-      emitType(context, type, sourceFile);
+
+      // Emit serialization/deserialization functions for flattened properties
+      for (const [property, _] of flattenPropertyModelMap) {
+        const namespaces = getModelNamespaces(context, property.type);
+        const filepath = getModelsPath(sourceRoot, namespaces);
+        sourceFile = outputProject.getSourceFile(filepath);
+        yield* addSerializationFunctions(context, property, sourceFile!, registry);
+      }
+    } finally {
+      flushSourceFileBatch();
     }
 
-    // Emit serialization/deserialization functions for flattened properties
-    for (const [property, _] of flattenPropertyModelMap) {
-      const namespaces = getModelNamespaces(context, property.type);
-      const filepath = getModelsPath(sourceRoot, namespaces);
-      sourceFile = outputProject.getSourceFile(filepath);
-      addSerializationFunctions(context, property, sourceFile!);
+    const modelFiles = outputProject.getSourceFiles(sourceRoot + "/models/**/*.ts");
+    const result = [];
+    for (const modelFile of modelFiles) {
+      if (
+        modelFile.getInterfaces().length === 0 &&
+        modelFile.getTypeAliases().length === 0 &&
+        modelFile.getEnums().length === 0
+      ) {
+        outputProject.removeSourceFile(modelFile);
+        continue;
+      }
+      result.push(modelFile);
     }
-  } finally {
-    flushSourceFileBatch();
-  }
 
-  const modelFiles = outputProject.getSourceFiles(sourceRoot + "/models/**/*.ts");
-  const result = [];
-  for (const modelFile of modelFiles) {
-    if (
-      modelFile.getInterfaces().length === 0 &&
-      modelFile.getTypeAliases().length === 0 &&
-      modelFile.getEnums().length === 0
-    ) {
-      outputProject.removeSourceFile(modelFile);
-      continue;
-    }
-    result.push(modelFile);
-  }
-
-  return result;
+    return result;
+  });
 }
 
 /**
@@ -203,95 +235,117 @@ export function emitNonModelResponseTypes(
   }
 }
 
-function emitType(context: SdkContext, type: SdkType, sourceFile: SourceFile) {
-  if (type.kind === "model") {
-    if (isAzureCoreErrorType(context.program, type.__raw)) {
-      return;
+function emitType(
+  context: SdkContext,
+  type: SdkType,
+  sourceFile: SourceFile,
+  registry: SourceGenerationRegistry,
+  discriminatedUnionInputs: ReadonlyMap<
+    SdkModelType,
+    {
+      readonly serializer: DiscriminatedUnionInput<SdkModelType>;
+      readonly deserializer: DiscriminatedUnionInput<SdkModelType>;
     }
-    if (isOrExtendsHttpFile(context.program, type.__raw!)) {
-      return;
-    }
-    if (
-      !type.usage ||
-      (type.usage !== undefined &&
-        (type.usage & UsageFlags.Output) !== UsageFlags.Output &&
-        (type.usage & UsageFlags.Input) !== UsageFlags.Input &&
-        (type.usage & UsageFlags.Exception) !== UsageFlags.Exception)
-    ) {
-      return;
-    }
-    if (!type.name && type.isGeneratedName) {
-      // TODO: https://github.com/Azure/typespec-azure/issues/1713 and https://github.com/microsoft/typespec/issues/4815
-      // throw new Error(`Generation of anonymous types`);
-      return;
-    }
-    const modelInterface = buildModelInterface(context, type);
-    if (type.discriminatorProperty) {
-      modelInterface.properties
-        ?.filter((p) => {
-          return p.name === normalizeModelPropertyName(context, type.discriminatorProperty!);
-        })
-        .map((p) => {
-          p.docs?.push(
-            `The discriminator possible values: ${Object.keys(type.discriminatedSubtypes ?? {}).join(", ")}`,
-          );
-          return p;
-        });
-    }
-    addDeclaration(sourceFile, modelInterface, type);
-    const modelPolymorphicType = buildModelPolymorphicType(context, type);
-    if (modelPolymorphicType) {
-      addSerializationFunctions(context, type, sourceFile, true);
-      addDeclaration(sourceFile, modelPolymorphicType, refkey(type, "polymorphicType"));
-    }
-    addSerializationFunctions(context, type, sourceFile);
-  } else if (type.kind === "enum") {
-    if (!type.usage) {
-      return;
-    }
-    const apiVersionEnumOnly = type.usage === UsageFlags.ApiVersionEnum;
-    // Skip known api version enums for multi-service scenarios as users are not allowed to set api versions
-    if (apiVersionEnumOnly && context.emitterOptions?.isMultiService) {
-      return;
-    }
-    const inputUsage = (type.usage & UsageFlags.Input) === UsageFlags.Input;
-    const outputUsage = (type.usage & UsageFlags.Output) === UsageFlags.Output;
-    const exceptionUsage = (type.usage & UsageFlags.Exception) === UsageFlags.Exception;
-    if (!(inputUsage || outputUsage || apiVersionEnumOnly || exceptionUsage)) {
-      return;
-    }
-    const [enumType, knownValuesEnum] = buildEnumTypes(
-      context,
-      type,
-      isExtensibleEnum(context, type),
-    );
-    if (enumType.name.startsWith("_")) {
-      // skip enum generation for internal enums
-      return;
-    }
-    if (apiVersionEnumOnly) {
-      // generate known values enum only for api version enums
-      addDeclaration(sourceFile, knownValuesEnum, refkey(knownValuesEnum.name, "knownValues"));
-    } else {
-      if (isExtensibleEnum(context, type)) {
-        addDeclaration(sourceFile, knownValuesEnum, refkey(type, "knownValues"));
+  >,
+) {
+  return Effect.gen(function* () {
+    if (type.kind === "model") {
+      if (isAzureCoreErrorType(context.program, type.__raw)) {
+        return;
       }
-      addDeclaration(sourceFile, enumType, type);
+      if (isOrExtendsHttpFile(context.program, type.__raw!)) {
+        return;
+      }
+      if (
+        !type.usage ||
+        (type.usage !== undefined &&
+          (type.usage & UsageFlags.Output) !== UsageFlags.Output &&
+          (type.usage & UsageFlags.Input) !== UsageFlags.Input &&
+          (type.usage & UsageFlags.Exception) !== UsageFlags.Exception)
+      ) {
+        return;
+      }
+      if (!type.name && type.isGeneratedName) {
+        // TODO: https://github.com/Azure/typespec-azure/issues/1713 and https://github.com/microsoft/typespec/issues/4815
+        // throw new Error(`Generation of anonymous types`);
+        return;
+      }
+      const selectedDiscriminatedUnionInputs = discriminatedUnionInputs.get(type);
+      const modelInterface = buildModelInterface(context, type);
+      if (type.discriminatorProperty) {
+        modelInterface.properties
+          ?.filter((p) => {
+            return p.name === normalizeModelPropertyName(context, type.discriminatorProperty!);
+          })
+          .map((p) => {
+            p.docs?.push(
+              `The discriminator possible values: ${Object.keys(type.discriminatedSubtypes ?? {}).join(", ")}`,
+            );
+            return p;
+          });
+      }
+      addDeclaration(sourceFile, modelInterface, type);
+      const modelPolymorphicType = buildModelPolymorphicType(context, type);
+      if (modelPolymorphicType) {
+        yield* addSerializationFunctions(context, type, sourceFile, registry, true);
+        addDeclaration(sourceFile, modelPolymorphicType, refkey(type, "polymorphicType"));
+      }
+      yield* addSerializationFunctions(
+        context,
+        type,
+        sourceFile,
+        registry,
+        false,
+        selectedDiscriminatedUnionInputs,
+      );
+    } else if (type.kind === "enum") {
+      if (!type.usage) {
+        return;
+      }
+      const apiVersionEnumOnly = type.usage === UsageFlags.ApiVersionEnum;
+      // Skip known api version enums for multi-service scenarios as users are not allowed to set api versions
+      if (apiVersionEnumOnly && context.emitterOptions?.isMultiService) {
+        return;
+      }
+      const inputUsage = (type.usage & UsageFlags.Input) === UsageFlags.Input;
+      const outputUsage = (type.usage & UsageFlags.Output) === UsageFlags.Output;
+      const exceptionUsage = (type.usage & UsageFlags.Exception) === UsageFlags.Exception;
+      if (!(inputUsage || outputUsage || apiVersionEnumOnly || exceptionUsage)) {
+        return;
+      }
+      const [enumType, knownValuesEnum] = buildEnumTypes(
+        context,
+        type,
+        isExtensibleEnum(context, type),
+      );
+      if (enumType.name.startsWith("_")) {
+        // skip enum generation for internal enums
+        return;
+      }
+      if (apiVersionEnumOnly) {
+        // generate known values enum only for api version enums
+        addDeclaration(sourceFile, knownValuesEnum, refkey(knownValuesEnum.name, "knownValues"));
+      } else {
+        if (isExtensibleEnum(context, type)) {
+          addDeclaration(sourceFile, knownValuesEnum, refkey(type, "knownValues"));
+        }
+        addDeclaration(sourceFile, enumType, type);
+      }
+    } else if (type.kind === "union") {
+      const unionType = buildUnionType(context, type);
+      addDeclaration(sourceFile, unionType, type);
+      yield* addSerializationFunctions(context, type, sourceFile, registry);
+    } else if (type.kind === "dict") {
+      addDeclaration(sourceFile, normalizeModelName(context, type), type);
+      yield* addSerializationFunctions(context, type, sourceFile, registry);
+    } else if (type.kind === "array") {
+      addDeclaration(sourceFile, normalizeModelName(context, type), type);
+      yield* addSerializationFunctions(context, type, sourceFile, registry);
+    } else if (type.kind === "nullable") {
+      const nullableType = buildNullableType(context, type);
+      addDeclaration(sourceFile, nullableType, type);
     }
-  } else if (type.kind === "union") {
-    const unionType = buildUnionType(context, type);
-    addDeclaration(sourceFile, unionType, type);
-    addSerializationFunctions(context, type, sourceFile);
-  } else if (type.kind === "dict") {
-    addDeclaration(sourceFile, normalizeModelName(context, type), type);
-    addSerializationFunctions(context, type, sourceFile);
-  } else if (type.kind === "array") {
-    addDeclaration(sourceFile, normalizeModelName(context, type), type);
-    addSerializationFunctions(context, type, sourceFile);
-  } else if (type.kind === "nullable") {
-    const nullableType = buildNullableType(context, type);
-    addDeclaration(sourceFile, nullableType, type);
-  }
+  });
 }
 
 export function getApiVersionEnum(context: SdkContext) {
@@ -406,96 +460,193 @@ function addSerializationFunctions(
   context: SdkContext,
   typeOrProperty: SdkType | SdkModelPropertyType,
   sourceFile: SourceFile,
+  registry: SourceGenerationRegistry,
   skipDiscriminatedUnionSuffix = false,
+  discriminatedUnionInputs?: {
+    readonly serializer: DiscriminatedUnionInput<SdkModelType>;
+    readonly deserializer: DiscriminatedUnionInput<SdkModelType>;
+  },
 ) {
-  const options = {
-    nameOnly: false,
-    skipDiscriminatedUnionSuffix,
+  return Effect.gen(function* () {
+    const options = {
+      nameOnly: false,
+      skipDiscriminatedUnionSuffix,
+    };
+
+    // Add JSON serializers
+    const serializationFunction =
+      typeOrProperty.kind === "property"
+        ? buildPropertySerializer(context, typeOrProperty, options)
+        : buildModelSerializer(context, typeOrProperty, options);
+
+    const serializerRefKey = getSerializationDeclarationRefkey(
+      typeOrProperty,
+      "serializer",
+      skipDiscriminatedUnionSuffix,
+    );
+    const deserializerRefKey = getSerializationDeclarationRefkey(
+      typeOrProperty,
+      "deserializer",
+      skipDiscriminatedUnionSuffix,
+    );
+    if (
+      serializationFunction &&
+      typeof serializationFunction !== "string" &&
+      serializationFunction.name
+    ) {
+      if (discriminatedUnionInputs && discriminatedUnionInputs.serializer.subtypes.length > 0) {
+        yield* pipe(
+          prepareDiscriminatedUnionDeclaration({
+            input: discriminatedUnionInputs.serializer,
+            direction: "serializer",
+            sourceFile,
+            declaration: serializationFunction,
+            targetRefkey: serializerRefKey,
+            subtypeDeclarationRefkey: (subtype) => refkey(subtype, "serializer"),
+            subtypeTypeRefkey: getDiscriminatedUnionSubtypeTypeRefkey,
+            legacyBaseRefkey: getSerializationDeclarationRefkey(typeOrProperty, "serializer", true),
+          }),
+          Effect.flatMap(registry.register),
+        );
+      } else {
+        addDeclaration(sourceFile, serializationFunction, serializerRefKey);
+      }
+    }
+    const deserializationFunction =
+      typeOrProperty.kind === "property"
+        ? buildPropertyDeserializer(context, typeOrProperty, options)
+        : buildModelDeserializer(context, typeOrProperty, options);
+    if (
+      deserializationFunction &&
+      typeof deserializationFunction !== "string" &&
+      deserializationFunction.name
+    ) {
+      if (discriminatedUnionInputs && discriminatedUnionInputs.deserializer.subtypes.length > 0) {
+        yield* pipe(
+          prepareDiscriminatedUnionDeclaration({
+            input: discriminatedUnionInputs.deserializer,
+            direction: "deserializer",
+            sourceFile,
+            declaration: deserializationFunction,
+            targetRefkey: deserializerRefKey,
+            subtypeDeclarationRefkey: (subtype) => refkey(subtype, "deserializer"),
+            subtypeTypeRefkey: getDiscriminatedUnionSubtypeTypeRefkey,
+            legacyBaseRefkey: getSerializationDeclarationRefkey(
+              typeOrProperty,
+              "deserializer",
+              true,
+            ),
+          }),
+          Effect.flatMap(registry.register),
+        );
+      } else {
+        addDeclaration(sourceFile, deserializationFunction, deserializerRefKey);
+      }
+    }
+
+    // Add XML serializers if the type has XML serialization options
+    if (typeOrProperty.kind === "model" && hasXmlSerialization(typeOrProperty)) {
+      const xmlSerializerRefKey = refkey(typeOrProperty, "xmlSerializer");
+      const xmlDeserializerRefKey = refkey(typeOrProperty, "xmlDeserializer");
+
+      const xmlSerializationFunction = buildXmlModelSerializer(context, typeOrProperty, options);
+      if (
+        xmlSerializationFunction &&
+        typeof xmlSerializationFunction !== "string" &&
+        xmlSerializationFunction.name
+      ) {
+        addDeclaration(sourceFile, xmlSerializationFunction, xmlSerializerRefKey);
+      }
+
+      const xmlDeserializationFunction = buildXmlModelDeserializer(
+        context,
+        typeOrProperty,
+        options,
+      );
+      if (
+        xmlDeserializationFunction &&
+        typeof xmlDeserializationFunction !== "string" &&
+        xmlDeserializationFunction.name
+      ) {
+        addDeclaration(sourceFile, xmlDeserializationFunction, xmlDeserializerRefKey);
+      }
+
+      // Only generate XML object serializer/deserializer for models that are
+      // actually nested as properties inside other XML models
+      if (isNestedInXmlModel(typeOrProperty)) {
+        const xmlObjectSerializerRefKey = refkey(typeOrProperty, "xmlObjectSerializer");
+        const xmlObjectDeserializerRefKey = refkey(typeOrProperty, "xmlObjectDeserializer");
+
+        const xmlObjectSerializationFunction = buildXmlObjectModelSerializer(
+          context,
+          typeOrProperty,
+          options,
+        );
+        if (
+          xmlObjectSerializationFunction &&
+          typeof xmlObjectSerializationFunction !== "string" &&
+          xmlObjectSerializationFunction.name
+        ) {
+          addDeclaration(sourceFile, xmlObjectSerializationFunction, xmlObjectSerializerRefKey);
+        }
+
+        const xmlObjectDeserializationFunction = buildXmlObjectModelDeserializer(
+          context,
+          typeOrProperty,
+          options,
+        );
+        if (
+          xmlObjectDeserializationFunction &&
+          typeof xmlObjectDeserializationFunction !== "string" &&
+          xmlObjectDeserializationFunction.name
+        ) {
+          addDeclaration(sourceFile, xmlObjectDeserializationFunction, xmlObjectDeserializerRefKey);
+        }
+      }
+    }
+  });
+}
+
+function getSerializationDeclarationRefkey(
+  typeOrProperty: unknown,
+  direction: "serializer" | "deserializer",
+  legacyBase: boolean,
+) {
+  return refkey(typeOrProperty, legacyBase ? `legacyBase${direction}` : direction);
+}
+
+function getDiscriminatedUnionSubtypeTypeRefkey(subtype: SdkModelType) {
+  return subtype.discriminatedSubtypes ? refkey(subtype, "polymorphicType") : refkey(subtype);
+}
+
+export function collectDiscriminatedUnionInput(
+  context: SdkContext,
+  type: SdkModelType,
+  usage: UsageFlags.Input | UsageFlags.Output,
+): DiscriminatedUnionInput<SdkModelType> {
+  const discriminator = type.discriminatorProperty;
+  return {
+    model: type,
+    name: normalizeModelName(context, type, NameType.Operation),
+    discriminator: discriminator
+      ? {
+          clientPropertyName: normalizeName(discriminator.name, NameType.Property),
+          wirePropertyName: getPropertySerializedName(discriminator),
+        }
+      : undefined,
+    subtypes: getDirectSubtypes(type)
+      .filter((subtype) => Boolean(subtype.usage && (subtype.usage & usage) === usage))
+      .map((subtype) => ({
+        model: subtype,
+        name: normalizeModelName(
+          context,
+          subtype,
+          NameType.Operation,
+          !subtype.discriminatedSubtypes,
+        ),
+        discriminatorValues: getAllDiscriminatedValues(subtype, discriminator),
+      })),
   };
-
-  // Add JSON serializers
-  const serializationFunction =
-    typeOrProperty.kind === "property"
-      ? buildPropertySerializer(context, typeOrProperty, options)
-      : buildModelSerializer(context, typeOrProperty, options);
-
-  const serializerRefKey = refkey(typeOrProperty, "serializer");
-  const deserializerRefKey = refkey(typeOrProperty, "deserializer");
-  if (
-    serializationFunction &&
-    typeof serializationFunction !== "string" &&
-    serializationFunction.name
-  ) {
-    addDeclaration(sourceFile, serializationFunction, serializerRefKey);
-  }
-  const deserializationFunction =
-    typeOrProperty.kind === "property"
-      ? buildPropertyDeserializer(context, typeOrProperty, options)
-      : buildModelDeserializer(context, typeOrProperty, options);
-  if (
-    deserializationFunction &&
-    typeof deserializationFunction !== "string" &&
-    deserializationFunction.name
-  ) {
-    addDeclaration(sourceFile, deserializationFunction, deserializerRefKey);
-  }
-
-  // Add XML serializers if the type has XML serialization options
-  if (typeOrProperty.kind === "model" && hasXmlSerialization(typeOrProperty)) {
-    const xmlSerializerRefKey = refkey(typeOrProperty, "xmlSerializer");
-    const xmlDeserializerRefKey = refkey(typeOrProperty, "xmlDeserializer");
-
-    const xmlSerializationFunction = buildXmlModelSerializer(context, typeOrProperty, options);
-    if (
-      xmlSerializationFunction &&
-      typeof xmlSerializationFunction !== "string" &&
-      xmlSerializationFunction.name
-    ) {
-      addDeclaration(sourceFile, xmlSerializationFunction, xmlSerializerRefKey);
-    }
-
-    const xmlDeserializationFunction = buildXmlModelDeserializer(context, typeOrProperty, options);
-    if (
-      xmlDeserializationFunction &&
-      typeof xmlDeserializationFunction !== "string" &&
-      xmlDeserializationFunction.name
-    ) {
-      addDeclaration(sourceFile, xmlDeserializationFunction, xmlDeserializerRefKey);
-    }
-
-    // Only generate XML object serializer/deserializer for models that are
-    // actually nested as properties inside other XML models
-    if (isNestedInXmlModel(typeOrProperty)) {
-      const xmlObjectSerializerRefKey = refkey(typeOrProperty, "xmlObjectSerializer");
-      const xmlObjectDeserializerRefKey = refkey(typeOrProperty, "xmlObjectDeserializer");
-
-      const xmlObjectSerializationFunction = buildXmlObjectModelSerializer(
-        context,
-        typeOrProperty,
-        options,
-      );
-      if (
-        xmlObjectSerializationFunction &&
-        typeof xmlObjectSerializationFunction !== "string" &&
-        xmlObjectSerializationFunction.name
-      ) {
-        addDeclaration(sourceFile, xmlObjectSerializationFunction, xmlObjectSerializerRefKey);
-      }
-
-      const xmlObjectDeserializationFunction = buildXmlObjectModelDeserializer(
-        context,
-        typeOrProperty,
-        options,
-      );
-      if (
-        xmlObjectDeserializationFunction &&
-        typeof xmlObjectDeserializationFunction !== "string" &&
-        xmlObjectDeserializationFunction.name
-      ) {
-        addDeclaration(sourceFile, xmlObjectDeserializationFunction, xmlObjectDeserializerRefKey);
-      }
-    }
-  }
 }
 
 function buildUnionType(context: SdkContext, type: SdkUnionType): TypeAliasDeclarationStructure {

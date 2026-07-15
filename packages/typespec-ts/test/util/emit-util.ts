@@ -12,8 +12,13 @@ import {
 } from "./test-util.js";
 
 import { expectDiagnosticEmpty } from "@typespec/compiler/testing";
+import { Effect } from "effect";
 import { useContext } from "../../src/context-manager.js";
 import { useBinder } from "../../src/framework/hooks/binder.js";
+import {
+  DeclarationRegistration,
+  makeProductionSourceGenerationLayer,
+} from "../../src/framework/source-generation.js";
 import { renameClientName } from "../../src/index.js";
 import { ClientOptions } from "../../src/interfaces.js";
 import { buildClassicalClient } from "../../src/modular/build-classical-client.js";
@@ -26,6 +31,19 @@ import { buildSubpathIndexFile } from "../../src/modular/build-subpath-index.js"
 import { emitSamples } from "../../src/modular/emit-samples.js";
 import { emitTests } from "../../src/modular/emit-tests.js";
 import { getClientHierarchyMap } from "../../src/utils/client-utils.js";
+
+async function emitTypesForTest(
+  context: Parameters<typeof emitTypes>[0],
+  options: Parameters<typeof emitTypes>[1],
+) {
+  const binder = useBinder();
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const registration = yield* DeclarationRegistration;
+      return yield* emitTypes(context, options, { register: registration.register });
+    }).pipe(Effect.provide(makeProductionSourceGenerationLayer(binder))),
+  );
+}
 
 export interface ModelConfigOptions extends ClientOptions {
   needOptions?: boolean;
@@ -83,7 +101,7 @@ export async function emitModularModelsFromTypeSpec(
     casing: "camel",
   });
   if (needOptions) {
-    emitTypes(dpgContext, { sourceRoot: "" });
+    await emitTypesForTest(dpgContext, { sourceRoot: "" });
     const clientMap = Array.from(getClientHierarchyMap(dpgContext));
     modelFile = buildApiOptions(dpgContext, clientMap[0]!, modularEmitterOptions);
     binder.resolveAllReferences("/");
@@ -91,7 +109,7 @@ export async function emitModularModelsFromTypeSpec(
       modelFile[0]!.fixUnusedIdentifiers();
     }
   } else {
-    const emittedFiles = emitTypes(dpgContext, { sourceRoot: "" });
+    const emittedFiles = await emitTypesForTest(dpgContext, { sourceRoot: "" });
     emitNonModelResponseTypes(dpgContext, { sourceRoot: "" });
     binder.resolveAllReferences("/");
     // After emitNonModelResponseTypes, the models file may have been updated or created
@@ -153,7 +171,7 @@ export async function emitRootIndexFromTypeSpec(
       overwrite: true,
     },
   );
-  emitTypes(dpgContext, modularEmitterOptions.modularOptions);
+  await emitTypesForTest(dpgContext, modularEmitterOptions.modularOptions);
   buildSubpathIndexFile(modularEmitterOptions, "models", undefined, {
     recursive: true,
   });
@@ -219,7 +237,7 @@ export async function emitModularOperationsFromTypeSpec(
     dpgContext.sdkPackage.clients.length > 0 &&
     dpgContext.sdkPackage.clients[0]
   ) {
-    emitTypes(dpgContext, { sourceRoot: "" });
+    await emitTypesForTest(dpgContext, { sourceRoot: "" });
     emitNonModelResponseTypes(dpgContext, { sourceRoot: "" });
     const clientMap = Array.from(getClientHierarchyMap(dpgContext));
     const res = buildOperationFiles(dpgContext, clientMap[0]!, modularEmitterOptions);
@@ -263,7 +281,7 @@ export async function emitModularClientContextFromTypeSpec(
     dpgContext.sdkPackage.clients.length > 0 &&
     dpgContext.sdkPackage.clients[0]
   ) {
-    emitTypes(dpgContext, { sourceRoot: "" });
+    await emitTypesForTest(dpgContext, { sourceRoot: "" });
     renameClientName(dpgContext.sdkPackage.clients[0], modularEmitterOptions);
     const clientMap = Array.from(getClientHierarchyMap(dpgContext));
     const res = buildClientContext(dpgContext, clientMap[0]!, modularEmitterOptions);
@@ -299,7 +317,7 @@ export async function emitModularClientFromTypeSpec(
     dpgContext.sdkPackage.clients.length > 0 &&
     dpgContext.sdkPackage.clients[0]
   ) {
-    emitTypes(dpgContext, { sourceRoot: "" });
+    await emitTypesForTest(dpgContext, { sourceRoot: "" });
     renameClientName(dpgContext.sdkPackage.clients[0], modularEmitterOptions);
     const clientMap = Array.from(getClientHierarchyMap(dpgContext));
     buildApiOptions(dpgContext, clientMap[0]!, modularEmitterOptions);
