@@ -41,10 +41,15 @@ import {
   createSdkContext,
   listAllServiceNamespaces,
 } from "@azure-tools/typespec-client-generator-core";
+import { Effect } from "effect";
 import { Project } from "ts-morph";
 import { provideBinder } from "./framework/hooks/binder.js";
 import { provideSdkTypes, resetSdkTypesState } from "./framework/hooks/sdk-types.js";
 import { loadStaticHelpers } from "./framework/load-static-helpers.js";
+import {
+  generateModularSources,
+  makeProductionSourceGenerationLayer,
+} from "./framework/source-generation.js";
 import { ClientModel, ClientOptions } from "./interfaces.js";
 import { EmitterOptions } from "./lib.js";
 import { buildApiExtractorConfig } from "./metadata/build-api-extractor-config.js";
@@ -268,64 +273,71 @@ export async function $onEmit(context: EmitContext) {
       casing: "camel",
     });
 
-    emitLoggerFile(modularEmitterOptions, sourcesRoot);
+    await Effect.runPromise(
+      generateModularSources(
+        { sourceRoot: sourcesRoot, testRoot: dpgContext.generationPathDetail?.rootDir },
+        (_registry) =>
+          Effect.gen(function* () {
+            emitLoggerFile(modularEmitterOptions, sourcesRoot);
 
-    const rootIndexFile = project.createSourceFile(`${sourcesRoot}/index.ts`, "", {
-      overwrite: true,
-    });
+            const rootIndexFile = project.createSourceFile(`${sourcesRoot}/index.ts`, "", {
+              overwrite: true,
+            });
 
-    emitTypes(dpgContext, { sourceRoot: sourcesRoot });
-    emitNonModelResponseTypes(dpgContext, { sourceRoot: sourcesRoot });
-    buildSubpathIndexFile(modularEmitterOptions, "models", undefined, {
-      recursive: true,
-    });
-    const clientMap = getClientHierarchyMap(dpgContext);
-    if (clientMap.length === 0) {
-      // If no clients, we still need to build the root index file
-      buildRootIndex(dpgContext, modularEmitterOptions, rootIndexFile);
-    }
-    for (const subClient of clientMap) {
-      await renameClientName(subClient[1], modularEmitterOptions);
-      buildApiOptions(dpgContext, subClient, modularEmitterOptions);
-      buildOperationFiles(dpgContext, subClient, modularEmitterOptions);
-      buildClientContext(dpgContext, subClient, modularEmitterOptions);
-      buildRestorePoller(dpgContext, subClient, modularEmitterOptions);
-      if (dpgContext.emitterOptions?.hierarchyClient) {
-        buildSubpathIndexFile(modularEmitterOptions, "api", subClient, {
-          exportIndex: false,
-          recursive: true,
-        });
-      } else {
-        buildSubpathIndexFile(modularEmitterOptions, "api", subClient, {
-          recursive: true,
-          exportIndex: true,
-        });
-      }
+            emitTypes(dpgContext, { sourceRoot: sourcesRoot });
+            emitNonModelResponseTypes(dpgContext, { sourceRoot: sourcesRoot });
+            buildSubpathIndexFile(modularEmitterOptions, "models", undefined, {
+              recursive: true,
+            });
+            const clientMap = getClientHierarchyMap(dpgContext);
+            if (clientMap.length === 0) {
+              // If no clients, we still need to build the root index file
+              buildRootIndex(dpgContext, modularEmitterOptions, rootIndexFile);
+            }
+            for (const subClient of clientMap) {
+              yield* Effect.promise(() => renameClientName(subClient[1], modularEmitterOptions));
+              buildApiOptions(dpgContext, subClient, modularEmitterOptions);
+              buildOperationFiles(dpgContext, subClient, modularEmitterOptions);
+              buildClientContext(dpgContext, subClient, modularEmitterOptions);
+              buildRestorePoller(dpgContext, subClient, modularEmitterOptions);
+              if (dpgContext.emitterOptions?.hierarchyClient) {
+                buildSubpathIndexFile(modularEmitterOptions, "api", subClient, {
+                  exportIndex: false,
+                  recursive: true,
+                });
+              } else {
+                buildSubpathIndexFile(modularEmitterOptions, "api", subClient, {
+                  recursive: true,
+                  exportIndex: true,
+                });
+              }
 
-      buildClassicalClient(dpgContext, subClient, modularEmitterOptions);
-      buildClassicOperationFiles(dpgContext, subClient, modularEmitterOptions);
-      buildSubpathIndexFile(modularEmitterOptions, "classic", subClient, {
-        exportIndex: true,
-        interfaceOnly: true,
-      });
-      const { subfolder } = getClientModuleInfo(subClient);
-      // Generate index file for clients with subfolders (multi-client scenarios and nested clients)
-      if (subfolder) {
-        buildSubClientIndexFile(dpgContext, subClient, modularEmitterOptions);
-      }
-      buildRootIndex(dpgContext, modularEmitterOptions, rootIndexFile, subClient);
-    }
-    // Sample generation is enabled only when the modular generator actually emits
-    // samples. Reset the baseline here, then re-enable it below if any are emitted.
-    dpgContext.emitterOptions!.generateSample = false;
-    if (emitterOptions["generate-sample"] === true) {
-      const samples = emitSamples(dpgContext);
-      if (samples.length > 0) {
-        dpgContext.emitterOptions!.generateSample = true;
-      }
-    }
+              buildClassicalClient(dpgContext, subClient, modularEmitterOptions);
+              buildClassicOperationFiles(dpgContext, subClient, modularEmitterOptions);
+              buildSubpathIndexFile(modularEmitterOptions, "classic", subClient, {
+                exportIndex: true,
+                interfaceOnly: true,
+              });
+              const { subfolder } = getClientModuleInfo(subClient);
+              // Generate index file for clients with subfolders (multi-client scenarios and nested clients)
+              if (subfolder) {
+                buildSubClientIndexFile(dpgContext, subClient, modularEmitterOptions);
+              }
+              buildRootIndex(dpgContext, modularEmitterOptions, rootIndexFile, subClient);
+            }
+            // Sample generation is enabled only when the modular generator actually emits
+            // samples. Reset the baseline here, then re-enable it below if any are emitted.
+            dpgContext.emitterOptions!.generateSample = false;
+            if (emitterOptions["generate-sample"] === true) {
+              const samples = emitSamples(dpgContext);
+              if (samples.length > 0) {
+                dpgContext.emitterOptions!.generateSample = true;
+              }
+            }
+          }),
+      ).pipe(Effect.provide(makeProductionSourceGenerationLayer(binder))),
+    );
 
-    binder.resolveAllReferences(sourcesRoot, dpgContext.generationPathDetail?.rootDir);
     if (program.compilerOptions.noEmit || program.hasError()) {
       return;
     }

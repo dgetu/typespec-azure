@@ -10,6 +10,7 @@ import { provideContext, useContext } from "../../context-manager.js";
 import { generateLocallyUniqueName } from "../../modular/helpers/naming-helpers.js";
 import { ReferenceableSymbol } from "../dependency.js";
 import { SourceFileSymbol, StaticHelperMetadata } from "../load-static-helpers.js";
+import { resolveReference } from "../reference.js";
 import { refkey } from "../refkey.js";
 import { provideDependencies, useDependencies } from "./use-dependencies.js";
 
@@ -36,7 +37,12 @@ export interface Binder {
    * @returns The tracked declaration name.
    */
   trackDeclaration(refkey: unknown, name: string, sourceFile: SourceFile): string;
-  resolveReference(refkey: unknown): string;
+  registerDeclaration(
+    refkey: unknown,
+    name: string,
+    sourceFile: SourceFile,
+    commit: (selectedName: string) => void,
+  ): string;
   resolveAllReferences(sourceRoot: string, testRoot?: string): void;
 }
 
@@ -63,6 +69,23 @@ class BinderImp implements Binder {
 
   trackDeclaration(refkey: unknown, name: string, sourceFile: SourceFile): string {
     const uniqueName = this.generateLocallyUniqueDeclarationName(name, sourceFile);
+    this.publishDeclaration(refkey, uniqueName, sourceFile);
+    return uniqueName;
+  }
+
+  registerDeclaration(
+    refkey: unknown,
+    name: string,
+    sourceFile: SourceFile,
+    commit: (selectedName: string) => void,
+  ): string {
+    const uniqueName = this.generateLocallyUniqueDeclarationName(name, sourceFile);
+    commit(uniqueName);
+    this.publishDeclaration(refkey, uniqueName, sourceFile);
+    return uniqueName;
+  }
+
+  private publishDeclaration(refkey: unknown, uniqueName: string, sourceFile: SourceFile): void {
     const declarationInfo: DeclarationInfo = { name: uniqueName, sourceFile };
     this.declarations.set(refkey, declarationInfo);
 
@@ -71,8 +94,6 @@ class BinderImp implements Binder {
       this.symbolsBySourceFile.set(sourceFile, new Set());
     }
     this.symbolsBySourceFile.get(sourceFile)!.add(uniqueName);
-
-    return uniqueName;
   }
 
   /**
@@ -108,27 +129,6 @@ class BinderImp implements Binder {
       name,
       new Set([...existingImports, ...actualImports, ...existingDeclarations]),
     );
-  }
-
-  /**
-   * Resolves a reference to a declaration.
-   *  If a declaration is not ready yet, a placeholder is added to the source file.
-   *  Placeholders will be resolved when the imports are applied.
-   * @param refkey - The reference key for the declaration.
-   * @param currentSourceFile - The current source file where the reference is being resolved.
-   * @returns The declaration information if resolved, or a placeholder if not found.
-   */
-  resolveReference(refkey: unknown): string {
-    return this.serializePlaceholder(refkey);
-  }
-
-  /**
-   * Serializes a placeholder reference key to a string.
-   * @param refkey - The reference key.
-   * @returns The serialized placeholder string.
-   */
-  private serializePlaceholder(refkey: unknown): string {
-    return `${PLACEHOLDER_PREFIX}${String(refkey)}__`;
   }
 
   /**
@@ -216,14 +216,14 @@ class BinderImp implements Binder {
       [unknown, DeclarationInfo | StaticHelperMetadata]
     >();
     for (const [key, value] of this.declarations) {
-      declarationByPlaceholder.set(this.serializePlaceholder(key), [key, value]);
+      declarationByPlaceholder.set(resolveReference(key), [key, value]);
     }
     for (const [key, value] of this.staticHelpers) {
-      declarationByPlaceholder.set(this.serializePlaceholder(key), [key, value]);
+      declarationByPlaceholder.set(resolveReference(key), [key, value]);
     }
     const dependencyByPlaceholder = new Map<string, ReferenceableSymbol>();
     for (const dependency of Object.values(this.dependencies)) {
-      dependencyByPlaceholder.set(this.serializePlaceholder(refkey(dependency)), dependency);
+      dependencyByPlaceholder.set(resolveReference(refkey(dependency)), dependency);
     }
 
     this.project.getSourceFiles().map((file) => {

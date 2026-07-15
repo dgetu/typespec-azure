@@ -83,6 +83,7 @@
     "@typespec/xml": "workspace:^"
   },
   "dependencies": {
+    "effect": "catalog:",
     "fast-xml-parser": "catalog:",
     "prettier": "catalog:",
     "ts-morph": "catalog:",

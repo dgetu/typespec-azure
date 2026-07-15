@@ -1,11 +1,8 @@
 import { ReferenceableSymbol } from "./dependency.js";
-import { useBinder } from "./hooks/binder.js";
 import { SourceFileSymbol, StaticHelperMetadata } from "./load-static-helpers.js";
 import { refkey as getRefkey } from "./refkey.js";
 
 export function resolveReference(refkey: unknown): string {
-  const binder = useBinder();
-
   let key = refkey;
 
   if (isReferenceableSymbol(key)) {
@@ -18,7 +15,7 @@ export function resolveReference(refkey: unknown): string {
 
   const stringRefkey = typeof key === "string" ? key : getRefkey(key);
 
-  return binder.resolveReference(stringRefkey);
+  return `__PLACEHOLDER_${String(stringRefkey)}__`;
 }
 
 function isReferenceableSymbol(obj: any): obj is ReferenceableSymbol {
