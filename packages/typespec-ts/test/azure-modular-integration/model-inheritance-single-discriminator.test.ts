@@ -2,6 +2,7 @@ import { assert, beforeEach, describe, it } from "vitest";
 
 import {
   Eagle,
+  Fish,
   SingleDiscriminatorClient,
   Sparrow,
 } from "./generated/type/model/inheritance/single-discriminator/src/index.js";
@@ -40,6 +41,10 @@ describe("SingleDiscriminatorClient Rest Client", () => {
       },
     },
   };
+  const validNoSubtypesBody: Fish = {
+    kind: "salmon",
+    size: 10,
+  };
   it("should get model with single discriminator", async () => {
     const result = await client.getModel();
     assert.deepEqual(result, validBody);
@@ -57,6 +62,16 @@ describe("SingleDiscriminatorClient Rest Client", () => {
 
   it("should put recursive model with single discriminator", async () => {
     const result = await client.putRecursiveModel(validRecursiveBody);
+    assert.isUndefined(result);
+  });
+
+  it("should get a discriminator model without subtypes", async () => {
+    const result = await client.getNoSubtypesModel();
+    assert.deepEqual(result, validNoSubtypesBody);
+  });
+
+  it("should put a discriminator model without subtypes", async () => {
+    const result = await client.putNoSubtypesModel(validNoSubtypesBody);
     assert.isUndefined(result);
   });
 

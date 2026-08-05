@@ -27,6 +27,35 @@ describe("PageableClient Classical Client", () => {
     assert.deepStrictEqual<Pet[]>(items, pets);
   });
 
+  it("Payload Pageable ServerDriven Pagination link string", async () => {
+    const items: Pet[] = [];
+    for await (const pet of client.serverDrivenPagination.linkString()) {
+      items.push(pet);
+    }
+    assert.deepStrictEqual(items, pets);
+  });
+
+  describe("PageSize", () => {
+    it("should list pets without continuation", async () => {
+      const items: Pet[] = [];
+      for await (const pet of client.pageSize.listWithoutContinuation()) {
+        items.push(pet);
+      }
+      assert.deepStrictEqual(items, pets);
+    });
+
+    it.each([
+      { pageSize: 2, expected: pets.slice(0, 2) },
+      { pageSize: 4, expected: pets },
+    ])("should list pets with page size $pageSize", async ({ pageSize, expected }) => {
+      const items: Pet[] = [];
+      for await (const pet of client.pageSize.listWithPageSize({ pageSize })) {
+        items.push(pet);
+      }
+      assert.deepStrictEqual(items, expected);
+    });
+  });
+
   describe("AlternateInitialVerb", () => {
     it("should list pets using post initial verb", async () => {
       const iter = client.serverDrivenPagination.alternateInitialVerb.post({
